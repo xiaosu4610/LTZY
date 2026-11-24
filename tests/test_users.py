@@ -1,11 +1,12 @@
 """Multi-user platform tests: roles, registration, balance, ePay V1/V2, SMTP stubs."""
 import json
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from http.client import HTTPConnection
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from unittest.mock import patch, MagicMock
 
 import mail
@@ -325,6 +326,48 @@ class UsersTests(unittest.TestCase):
             self.assertEqual(row['smtp_pass'], 'newpass')
             self.assertEqual(row['epay_key'], 'newkey')
             self.assertEqual(row['smtp_host'], 'smtp2.test')
+
+    def test_stalled_smtp_never_blocks_login_or_writes(self):
+        """A hung mail host must not freeze login or key creation (issue #13).
+
+        send-code used to hold the process-wide login_lock while smtplib waited out its
+        timeout, so one bad SMTP host stalled every writer. The registration window is now
+        committed first and the SMTP handshake runs outside login_lock and outside the
+        write transaction.
+        """
+        self.admin_login()
+        with self.db() as db:
+            db.execute("UPDATE settings SET smtp_host='smtp.test', smtp_from='ltzy@test.dev', smtp_port=587")
+        entered, release = Event(), Event()
+
+        def hang(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            raise OSError('mail host timed out')
+
+        with patch.object(mail, 'send', hang):
+            sender = Thread(target=self.call, args=('/api/email/send-code', {'email': 'slow@test.dev'}))
+            sender.start()
+            self.assertTrue(entered.wait(5), 'stub SMTP never received the send')
+            time.sleep(0.2)  # Confirm the request really is mid-send, not already answered.
+
+            started = time.monotonic()
+            password = (Path(self.tmp.name) / 'admin-password.txt').read_text().strip()
+            status, _, _ = self.call('/api/login', {'password': password})
+            self.assertEqual(status, 200)
+            self.assertLess(time.monotonic() - started, 1.0, 'login waited on a stalled SMTP send')
+
+            started = time.monotonic()
+            self.assertEqual(self.call('/api/keys', {'name': 'during-smtp'})[0], 200)
+            self.assertLess(time.monotonic() - started, 1.0, 'key creation waited on a stalled SMTP send')
+
+            release.set()
+            sender.join(10)
+            self.assertFalse(sender.is_alive())
+
+        # The failed send is reported and leaves no usability-invisible code behind.
+        with self.db() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM email_tokens WHERE email='slow@test.dev'").fetchone())
 
     def test_test_email_requires_valid_address_and_config(self):
         self.admin_login()

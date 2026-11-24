@@ -237,6 +237,11 @@ def create_user(db, obj, cfg):
 
 
 def issue_email_code(db, email, now_ts):
+    """Stage a registration code; only database work happens here.
+
+    The SMTP handshake is run by the caller *after* it commits, so a slow or
+    unreachable mail host never holds the write lock or login_lock.
+    """
     if not valid_email(email):
         raise Problem(400, '请输入有效的邮箱地址')
     email = email.strip().lower()
@@ -250,12 +255,16 @@ def issue_email_code(db, email, now_ts):
     code = f'{secrets.randbelow(1000000):06d}'
     db.execute('INSERT INTO email_tokens VALUES(?,?,?,?,0)',
                (code, email, 'register', int(now_ts) + 600))
+    return code, email, cfg
+
+
+def send_email_code(cfg, email, code):
+    """Deliver a staged code. Callers run this after committing and outside login_lock."""
     try:
         mail.send(cfg, email, 'LTZY 注册验证码',
                   f'你的 LTZY 注册验证码是 {code}，10 分钟内有效。若非本人操作请忽略本邮件。')
-    except OSError as exc:
+    except OSError:
         raise Problem(502, '邮件发送失败，请检查 SMTP 配置或稍后重试') from None
-    return code
 
 
 def handle_pay_notify(db, params):
@@ -524,8 +533,18 @@ class Handler(BaseHTTPRequestHandler):
                     failures.popleft()
                 if len(failures) >= 30:
                     raise Problem(429,'验证码请求过于频繁，请稍后再试')
-                code = issue_email_code(db,obj.get('email'),time.time())
+                # Only the counter and the staging INSERT run under the lock.
+                code, email, cfg = issue_email_code(db,obj.get('email'),time.time())
                 failures.append(now)
+            # Commit the registration window before touching the network, then send
+            # outside both the lock and the write transaction (see issue #13).
+            db.commit()
+            try:
+                send_email_code(cfg, email, code)
+            except Problem:
+                # The mail never went out, so do not leave a code the user cannot know.
+                db.execute('DELETE FROM email_tokens WHERE code=? AND email=?', (code, email))
+                raise
             return {'ok':True},headers
         if path == '/api/login':
             raise Problem(405,'Use POST')
