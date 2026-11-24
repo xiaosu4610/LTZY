@@ -257,6 +257,25 @@ class UsersTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT status FROM recharges WHERE out_trade_no=?',
                                         (q2['out_trade_no'],)).fetchone()[0], 'pending')
 
+    def test_epay_concurrent_notify_credits_exactly_once(self):
+        self.configure_epay('v1')
+        code, order, _ = self.call('/api/recharge', {'amount': 5, 'channel': 'alipay'})
+        self.assertEqual(code, 200)
+        from urllib.parse import urlparse, parse_qsl
+        from concurrent.futures import ThreadPoolExecutor
+        query = dict(parse_qsl(urlparse(order['payurl']).query))
+        paid = {**query, 'trade_no': 'T-RACE',
+                'sign': pay.sign({**query, 'trade_no': 'T-RACE'}, 'secretkey123')}
+        # Eight concurrent, identical, correctly-signed callbacks for one order.
+        with ThreadPoolExecutor(8) as pool:
+            answers = list(pool.map(lambda _: self.notify(paid), range(8)))
+        self.assertEqual(answers, ['success'] * 8)
+        view = self.call('/api/workspace')[1]
+        self.assertEqual(view['me']['balance'], 30)  # $25 admin floor + exactly one $5 credit.
+        with self.db() as db:
+            credits = db.execute("SELECT count(*) FROM balance_audit WHERE reason LIKE 'recharge %'").fetchone()[0]
+            self.assertEqual(credits, 1)
+
     def notify(self, params):
         from urllib.parse import urlencode
         code, body, _ = self.call('/pay/notify?' + urlencode(params))

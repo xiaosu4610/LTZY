@@ -271,8 +271,13 @@ def handle_pay_notify(db, params):
         return 'success'
     if int(Decimal(params.get('money', '0')) * 1000000) != order['amount_micros']:
         return 'fail'
-    db.execute("UPDATE recharges SET status='paid', trade_no=?, paid_at=? WHERE id=? AND status='pending'",
-               (params.get('trade_no', ''), datetime.now(timezone.utc).isoformat(), order['id']))
+    # The conditional UPDATE is the claim on this order: only the single request
+    # that flips pending->paid may credit. Concurrent duplicate callbacks lose the
+    # race here and return without touching the balance.
+    claimed = db.execute("UPDATE recharges SET status='paid', trade_no=?, paid_at=? WHERE id=? AND status='pending'",
+                         (params.get('trade_no', ''), datetime.now(timezone.utc).isoformat(), order['id']))
+    if claimed.rowcount != 1:
+        return 'success'  # A concurrent notify already settled this order.
     db.execute('UPDATE users SET balance_micros=balance_micros+? WHERE id=?',
                (order['amount_micros'], order['user_id']))
     db.execute('INSERT INTO balance_audit VALUES(?,?,?,?,?,?)',
@@ -471,6 +476,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
             with closing(connect(self.server.db_path)) as db:
+                # Serialize settlement with any other writer before reading the
+                # order status; otherwise two concurrent callbacks can both see
+                # 'pending' and credit the same recharge more than once.
+                db.execute('BEGIN IMMEDIATE')
                 answer = handle_pay_notify(db, params)
                 db.commit()
             self.reply(200, answer.encode('utf-8'), 'text/plain; charset=utf-8')
