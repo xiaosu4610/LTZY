@@ -157,7 +157,9 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn('pending',g.snapshot(self.db,public=True))
 
     def test_malformed_disabled(self):
-        for change in ({'messages':[]},{'stream':'yes'},{'tools':[]},{'max_tokens':True}):
+        # `tools: []` is now a legal passthrough field (issue #6), so it is no
+        # longer expected to be rejected; `top_p` out of range is rejected.
+        for change in ({'messages':[]},{'stream':'yes'},{'max_tokens':True},{'top_p':5}):
             self.assertEqual(self.call(dict(self.p,**change)).status,400)
         self.assertEqual(self.call(dict(self.p,model='unknown')).status,404)
         with self.db:
@@ -226,3 +228,58 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.snapshot()['requests'][0]['settlement'],'pending')
         self.assertNotIn('provider-test',json.dumps(self.snapshot()))
 
+
+    def test_message_text_projection(self):
+        m = dict(role='user', content=[
+            dict(type='text', text='hi '),
+            dict(type='image_url', image_url=dict(url='https://example.com/x.png')),
+            dict(type='text', text='there')])
+        self.assertEqual(g.message_text(m), 'hi there')
+        self.assertEqual(g.message_text(dict(role='user', content='plain')), 'plain')
+
+    def test_passthrough_fields_accepted_and_forwarded(self):
+        # issue #6: mainstream clients send these on the first request.
+        p = dict(self.p, top_p=0.9, seed=7, n=2, user='tester',
+                 frequency_penalty=0.1, presence_penalty=-0.5, logprobs=True,
+                 top_logprobs=3, parallel_tool_calls=True, store=False,
+                 stop=['\n'], response_format=dict(type='json_object'),
+                 metadata=dict(team='core'), logit_bias={'50256': -100},
+                 reasoning_effort='low',
+                 tools=[dict(type='function', function=dict(
+                     name='get_weather', parameters=dict(type='object')))],
+                 tool_choice='auto')
+        out = g.payload(Request(p, 'client-test'))
+        for k, v in p.items():
+            self.assertEqual(out[k], v)  # forwarded verbatim, not dropped
+        self.assertEqual(out['stream'], False)  # gateway fills its own defaults
+        r = self.call(p)
+        self.assertEqual(r.status, 200, r.wfile.getvalue())
+
+    def test_multimodal_content_bills_text_only(self):
+        image = [dict(type='text', text='sensitive prompt'),
+                 dict(type='image_url', image_url=dict(url='https://example.com/x.png'))]
+        r = self.call(dict(self.p, messages=[dict(role='user', content=image)]))
+        self.assertEqual(r.status, 200, r.wfile.getvalue())
+        with_image = self.snapshot()['requests'][0]['cost']
+        self.call(dict(self.p, messages=[dict(role='user', content='sensitive prompt')]))
+        plain = self.snapshot()['requests'][0]['cost']
+        self.assertEqual(with_image, plain)  # no vision tokens are invented
+        self.assertNotIn('x.png', json.dumps(self.snapshot()))
+
+    def test_tool_conversation_shapes(self):
+        p = dict(self.p, messages=[
+            dict(role='system', name='policy', content='be brief'),
+            dict(role='assistant', content='', tool_calls=[
+                dict(id='call_1', type='function',
+                     function=dict(name='get_weather', arguments='{}'))]),
+            dict(role='tool', tool_call_id='call_1', content='sunny')])
+        self.assertEqual(self.call(p).status, 200)
+        bad = dict(self.p, messages=[dict(role='tool', content='sunny')])
+        self.assertEqual(self.call(bad).status, 400)
+
+    def test_unknown_and_mistyped_fields_still_rejected(self):
+        for change in ({'banana': 1}, {'top_p': 5}, {'seed': 'x'}, {'n': 0},
+                      {'parallel_tool_calls': 'yes'}, {'tools': [dict(type='plugin')]},
+                      {'response_format': 'json'}, {'tool_choice': 'sometimes'},
+                      {'logit_bias': {'x': 1}}, {'metadata': dict(a=1)}):
+            self.assertEqual(self.call(dict(self.p, **change)).status, 400)

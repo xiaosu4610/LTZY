@@ -198,6 +198,99 @@ def authenticate(h, db):
     raise Problem(401, 'invalid_api_key')
 
 
+# Fields the relay bills and routes on. Everything else in the OpenAI request
+# shape is forwarded to the upstream unchanged instead of being rejected.
+CONTROL_FIELDS = frozenset({'messages','model','max_tokens','temperature','stream','stream_options'})
+PASSTHROUGH_FIELDS = frozenset({
+    'top_p','frequency_penalty','presence_penalty','seed','user','n','stop',
+    'logprobs','top_logprobs','logit_bias','response_format','tools',
+    'tool_choice','parallel_tool_calls','reasoning_effort','metadata','store',
+})
+MESSAGE_ROLES = frozenset({'system','developer','user','assistant','tool'})
+MESSAGE_FIELDS = frozenset({'role','content','name','tool_calls','tool_call_id'})
+MAX_CONTENT_PARTS = 512
+MAX_TOOLS = 64
+
+
+def _number(value, lo, hi):
+    return type(value) in (int, float) and lo <= value <= hi
+
+
+def _valid_tools(value):
+    if not isinstance(value, list) or len(value) > MAX_TOOLS:
+        return False
+    for tool in value:
+        fn = tool.get('function') if isinstance(tool, dict) and tool.get('type') == 'function' else None
+        if not isinstance(fn, dict):
+            return False
+        if not isinstance(fn.get('name'), str) or not valid_id(fn['name']):
+            return False
+        if 'description' in fn and not isinstance(fn['description'], str):
+            return False
+        if 'parameters' in fn and not isinstance(fn['parameters'], dict):
+            return False
+        if 'strict' in fn and type(fn['strict']) is not bool:
+            return False
+    return True
+
+
+def _valid_tool_choice(value):
+    if value in ('none', 'auto', 'required'):
+        return True
+    if isinstance(value, dict) and value.get('type') == 'function':
+        fn = value.get('function')
+        return isinstance(fn, dict) and isinstance(fn.get('name'), str) and valid_id(fn['name'])
+    return False
+
+
+def _valid_response_format(value):
+    if not isinstance(value, dict) or set(value) - {'type', 'json_schema'}:
+        return False
+    if value.get('type') == 'text':
+        return True
+    if value.get('type') == 'json_object':
+        return 'json_schema' not in value or isinstance(value['json_schema'], dict)
+    return False
+
+
+def check_message(m):
+    """Validate one chat message, accepting the OpenAI shapes the relay forwards."""
+    if not isinstance(m, dict) or set(m) - MESSAGE_FIELDS:
+        raise ValueError
+    if 'role' not in m or 'content' not in m or m['role'] not in MESSAGE_ROLES:
+        raise ValueError
+    if m['role'] == 'tool' and (not isinstance(m.get('tool_call_id'), str) or not m.get('tool_call_id')):
+        raise ValueError
+    if m['role'] == 'assistant' and 'tool_calls' in m and not isinstance(m['tool_calls'], list):
+        raise ValueError
+    if 'name' in m and not isinstance(m['name'], str):
+        raise ValueError
+    content = m['content']
+    if isinstance(content, str):
+        content.encode('utf-8')
+        return
+    if not isinstance(content, list) or len(content) > MAX_CONTENT_PARTS:
+        raise ValueError
+    for part in content:
+        if not isinstance(part, dict) or part.get('type') not in ('text', 'image_url'):
+            raise ValueError
+        if part['type'] == 'text':
+            if not isinstance(part.get('text'), str):
+                raise ValueError
+            part['text'].encode('utf-8')
+        elif not isinstance(part.get('image_url'), dict):
+            raise ValueError
+
+
+def message_text(m):
+    """Text projection of a message: what a single-project relay bills and echoes."""
+    content = m['content']
+    if isinstance(content, str):
+        return content
+    return ''.join(part['text'] for part in content
+                   if isinstance(part, dict) and part.get('type') == 'text'
+                   and isinstance(part.get('text'), str))
+
 def payload(h):
     try:
         lengths = h.headers.get_all('Content-Length', [])
@@ -210,15 +303,50 @@ def payload(h):
         if size <= 0 or h.headers.get('Transfer-Encoding'):
             raise ValueError
         p = json.loads(h.rfile.read(size).decode('utf-8'))
-        if not isinstance(p, dict) or set(p) - {'messages','model','max_tokens','temperature','stream','stream_options'}:
+        if not isinstance(p, dict) or set(p) - CONTROL_FIELDS - PASSTHROUGH_FIELDS:
             raise ValueError
         if not valid_id(p['model']) or not isinstance(p['messages'], list) or not 1 <= len(p['messages']) <= 256:
             raise ValueError
         for m in p['messages']:
-            if (not isinstance(m, dict) or set(m) != {'role','content'} or
-                    m['role'] not in ('user','assistant','system','developer') or not isinstance(m['content'],str)):
+            check_message(m)
+        if 'top_p' in p and not _number(p['top_p'], 0, 1):
+            raise ValueError
+        for field in ('frequency_penalty', 'presence_penalty'):
+            if field in p and not _number(p[field], -2, 2):
                 raise ValueError
-            m['content'].encode('utf-8')
+        if 'seed' in p and (type(p['seed']) is not int or not 0 <= p['seed'] <= 2147483647):
+            raise ValueError
+        if 'user' in p and (not isinstance(p['user'], str) or not 1 <= len(p['user']) <= 256):
+            raise ValueError
+        if 'n' in p and (type(p['n']) is not int or not 1 <= p['n'] <= 8):
+            raise ValueError
+        if 'stop' in p and not (p['stop'] is None or isinstance(p['stop'], str)
+                               or (isinstance(p['stop'], list) and len(p['stop']) <= 4
+                                   and all(isinstance(x, str) for x in p['stop']))):
+            raise ValueError
+        if 'logprobs' in p and type(p['logprobs']) is not bool:
+            raise ValueError
+        if 'top_logprobs' in p and (type(p['top_logprobs']) is not int or not 0 <= p['top_logprobs'] <= 20):
+            raise ValueError
+        if 'parallel_tool_calls' in p and type(p['parallel_tool_calls']) is not bool:
+            raise ValueError
+        if 'store' in p and type(p['store']) is not bool:
+            raise ValueError
+        if 'tools' in p and not _valid_tools(p['tools']):
+            raise ValueError
+        if 'tool_choice' in p and not _valid_tool_choice(p['tool_choice']):
+            raise ValueError
+        if 'reasoning_effort' in p and p['reasoning_effort'] not in ('low', 'medium', 'high'):
+            raise ValueError
+        if 'response_format' in p and not _valid_response_format(p['response_format']):
+            raise ValueError
+        if 'logit_bias' in p and not (isinstance(p['logit_bias'], dict)
+                and all(re.fullmatch(r'-?[0-9]+', k) and type(v) is int and -100 <= v <= 100
+                        for k, v in p['logit_bias'].items())):
+            raise ValueError
+        if 'metadata' in p and not (isinstance(p['metadata'], dict)
+                and all(isinstance(k, str) and isinstance(v, str) for k, v in p['metadata'].items())):
+            raise ValueError
         if type(p.setdefault('max_tokens',256)) is not int or not 1 <= p['max_tokens'] <= 65536:
             raise ValueError
         if type(p.setdefault('stream',False)) is not bool:
@@ -253,8 +381,8 @@ def send_json(h,status,obj,rid):
 
 def local(lane,p,rid):
     # This adapter's documented token unit is one Unicode character, not a vendor tokenizer.
-    prompt = sum(len(m['content'])+1 for m in p['messages'])
-    text = ('Local test: '+p['messages'][-1]['content'])[:p['max_tokens']]
+    prompt = sum(len(message_text(m))+1 for m in p['messages'])
+    text = ('Local test: '+message_text(p['messages'][-1]))[:p['max_tokens']]
     use = dict(prompt_tokens=prompt, completion_tokens=len(text), total_tokens=prompt+len(text))
     base = dict(id=rid,created=int(time.time()),model=p['model'])
     if p['stream']:
@@ -324,11 +452,11 @@ def reserve(db,h,p,rid):
         if not candidates:
             raise Problem(503,'no_enabled_lane')
         candidates = [l for l in candidates if p['max_tokens'] <= l['context'] and
-                      (l['kind']!='local-test' or sum(len(m['content'])+1 for m in p['messages'])+p['max_tokens']<=l['context'])]
+                      (l['kind']!='local-test' or sum(len(message_text(m))+1 for m in p['messages'])+p['max_tokens']<=l['context'])]
         if not candidates:
             raise Problem(400,'context_limit')
         # No tokenizer guessing for HTTPS lanes: hold full configured input context plus output cap.
-        local_input=sum(len(m['content'])+1 for m in p['messages'])
+        local_input=sum(len(message_text(m))+1 for m in p['messages'])
         amount=max(micros(price_of(l), local_input if l['kind']=='local-test' else l['context'],p['max_tokens']) for l in candidates)
         limit,spent,held=funds(db,uid)
         if amount > limit-spent-held:
