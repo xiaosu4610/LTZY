@@ -33,4 +33,8 @@ def send(cfg, to, subject, body):
             server.login(cfg['smtp_user'], cfg['smtp_pass'])
         server.sendmail(cfg['smtp_from'], [to], msg.as_string())
     finally:
-        server.quit()
+        try:
+            server.quit()
+        except OSError:
+            # Teardown must never mask the delivery error the caller needs to see.
+            pass
